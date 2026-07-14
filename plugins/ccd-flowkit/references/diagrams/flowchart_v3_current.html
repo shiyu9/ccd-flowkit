@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ccd-flowkit 開発フロー フローチャート v3-current（integrator モデル・フラット化実装済み）</title>
+<style>
+  body{margin:0;background:#0f1115;color:#e8eaed;
+    font-family:-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;padding:16px;max-width:960px}
+  h1{font-size:19px;margin:0 0 2px}
+  h2{font-size:15px;margin:26px 0 4px;color:#c9d4e3;border-top:1px solid #2a3140;padding-top:14px}
+  h3{font-size:13.5px;margin:10px 0 4px;color:#c9d4e3}
+  p.sub{color:#9aa4b2;font-size:12.5px;margin:0 0 10px}
+  p.note{color:#b8c2d0;font-size:12.5px;line-height:1.75;margin:6px 0 12px}
+  .legend{display:flex;flex-wrap:wrap;gap:7px;margin:0 0 12px}
+  .legend span{font-size:11.5px;padding:3px 8px;border-radius:6px;color:#fff}
+  .wrap{overflow-x:auto;background:#12151b;border:1px solid #232a36;border-radius:10px;padding:8px}
+  svg{width:100%;height:auto;min-width:360px;max-width:900px;display:block;margin:0 auto}
+  text{font-family:inherit}
+  ul{color:#b8c2d0;font-size:12.5px;line-height:1.75;margin:4px 0 12px}
+  ul.new li::before{content:"NEW "; color:#3fb950; font-weight:700}
+  ul.del li::before{content:"DEL "; color:#da3633; font-weight:700}
+  ul.up li::before{content:"UP  "; color:#f78166; font-weight:700}
+  code{background:#1c2230;border-radius:4px;padding:1px 5px;font-size:11.5px}
+  table{border-collapse:collapse;font-size:12px;margin:8px 0;color:#c9d4e3;width:100%}
+  th,td{border:1px solid #2a3140;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#1c2230}
+  .banner{background:#1c2230;border-left:4px solid #3fb950;padding:10px 14px;margin:12px 0;font-size:12.5px;color:#c9d4e3;line-height:1.75}
+  .warn{background:#2a1a1a;border-left:4px solid #da3633;padding:10px 14px;margin:12px 0;font-size:12.5px;color:#e8d0d0;line-height:1.75}
+</style>
+</head>
+<body>
+  <h1>ccd-flowkit 開発フロー フローチャート v3-current（integrator モデル）</h1>
+  <p class="sub">フラット化モデル・現行実装の正本。旧集約役モデル（main → 集約役 → 観点サブ×N の階層構造）は、Claude Code の Task 非同期モデルにおいて子完了通知が親でなく main へ届く仕様と不整合であり、集約役の再委任のたびに fresh インスタンスが立ち上がり過去の観点結果を失う構造欠陥を持っていた。フラット化モデルはこれをフラットな三段構成（main が観点サブを直接並列起動→ state に結果保存→ integrator が state を読んで統合＋判定）に解消し、サブ→サブの起動を不変条件として禁止する。
+  対象は 5 レビューノード全て（DES/SYS/INT/BLD/UNIT_REVIEW）。状態機械（図1のノード位相）は不変で、変わったのは<b>各レビューノードの内部フロー</b>と<b>フック配置</b>のみ。</p>
+
+  <div class="banner">
+    <b>フラット化の一言</b>: 集約役（build-reviewer 等）が「観点サブを起動して結果を統合する」多責務エージェントだったのを、
+    <b>「main が観点サブを直列起動→結果を state に保存→integrator（旧集約役）が state を読んで統合＋判定」</b>の3段構成に分離した。
+    サブ→サブの起動は<b>普遍的に禁止</b>し、階層的呼び出しの再発を構造的に防ぐ（hook_check_subagent_launch が agent_type 付き Task|Agent を無条件 deny）。
+  </div>
+
+  <div class="legend">
+    <span style="background:#1f6feb">生成/実装/試験</span>
+    <span style="background:#d29922;color:#1a1300">レビュー（integrator）</span>
+    <span style="background:#8957e5">軽量ゲート（gate-runner）</span>
+    <span style="background:#6639ba">重ゲート（consistency-checker）</span>
+    <span style="background:#2ea043">ユーザー承認</span>
+    <span style="background:#da3633">是正(FIX)</span>
+    <span style="background:#3fb950;color:#0f1115">FLAT（v3-current から変更）</span>
+  </div>
+
+  <h2>設計判断の要約</h2>
+  <table>
+    <tr><th>項目</th><th>判断</th><th>備考</th></tr>
+    <tr><td>観点結果の伝達</td><td><b>ファイル</b>: <code>state/review_results/&lt;NODE&gt;.jsonl</code></td><td>セッション中断耐性・監査可能性・context節約</td></tr>
+    <tr><td>ファイルの書込主体</td><td><b>main</b>（Task結果受領直後にBash appendで書込）</td><td>Perspective sub の tools 変更不要</td></tr>
+    <tr><td>integrator の戻り値語彙</td><td><code>pass</code> / <code>high</code> / <code>rerun</code></td><td>rerun には対象 observer と理由を含める</td></tr>
+    <tr><td>rerun 上限</td><td><code>RERUN_LIMIT_PER_ROUND = 2</code></td><td>manage_flow_state.py に正本化</td></tr>
+    <tr><td>rerun 上限判定</td><td>新スクリプト <code>check_rerun_limit.py</code></td><td>_advance_audit.jsonl から集計</td></tr>
+    <tr><td>上限超過時の処理</td><td>AskUserQuestion（強制収束はしない）</td><td>ユーザー判断: 続行/免除/方針変更</td></tr>
+    <tr><td>中立性</td><td>「是正者→レビュワー」「観点サブ間」の中立性は<b>維持</b></td><td>全量再読は3成分モデルで解消済み</td></tr>
+    <tr><td>サブ→サブ起動</td><td><b>プラグイン全体で普遍的に禁止</b></td><td>階層構造の再発を構造的に防ぐ不変条件</td></tr>
+    <tr><td>状態機械</td><td>不変</td><td>NODE_AGENT／TRANSITIONS 変更なし</td></tr>
+  </table>
+
+  <h2>図1: メインパイプライン（フラット化後・v2 と同粒度）</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 720 1920" role="img" aria-label="開発フロー メインパイプライン フラット化後">
+    <defs>
+      <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#9aa4b2"/></marker>
+      <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#da3633"/></marker>
+    </defs>
+    <style>
+      .b{rx:8}
+      .p{fill:#1f6feb}.rv{fill:#d29922}.gl{fill:#8957e5}.gh{fill:#6639ba}.us{fill:#2ea043}.fx{fill:#da3633}
+      .lb{fill:#e8eaed;font-size:12.5px;font-weight:600;text-anchor:middle}
+      .lbr{fill:#e8eaed;font-size:11.5px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.94}
+      .flat{fill:#3fb950;font-size:9.5px;font-weight:700;text-anchor:middle}
+      .dl{fill:#1a1300}
+      .edge{stroke:#9aa4b2;stroke-width:1.6;fill:none;marker-end:url(#ah)}
+      .eredge{stroke:#da3633;stroke-width:1.6;fill:none;marker-end:url(#ahr);stroke-dasharray:5 4}
+      .et{fill:#9aa4b2;font-size:10.5px}.ok{fill:#2ea043;font-size:10.5px;font-weight:700}
+      .ng{fill:#da3633;font-size:10.5px;font-weight:700}
+    </style>
+
+    <ellipse cx="220" cy="30" rx="60" ry="18" fill="#3a4150"/>
+    <text class="lb" x="220" y="34">START</text>
+    <path class="edge" d="M220,48 L220,68"/>
+
+    <rect class="b p" x="70" y="72" width="300" height="44"/>
+    <text class="lb" x="220" y="90">REQ_PLAN（project-planner）</text>
+    <text class="lb2" x="220" y="106">要望書 → 要件案（plan mode）</text>
+    <path class="edge" d="M220,116 L220,144"/>
+    <text class="et" x="228" y="134">done</text>
+
+    <rect class="b us" x="70" y="148" width="300" height="44"/>
+    <text class="lb" x="220" y="166">REQ_APPROVE（ユーザー承認）</text>
+    <text class="lb2" x="220" y="182">AskUserQuestion で仲介・advance は planner</text>
+    <path class="eredge" d="M70,170 C26,170 26,94 64,94"/>
+    <text class="ng" x="8" y="136">revise</text>
+    <path class="edge" d="M220,192 L220,220"/>
+    <text class="ok" x="228" y="210">approve</text>
+
+    <rect class="b p" x="70" y="224" width="300" height="44"/>
+    <text class="lb" x="220" y="242">REQ_WRITE（project-planner）</text>
+    <text class="lb2" x="220" y="258">要件定義書の書き出し</text>
+    <path class="edge" d="M220,268 L220,296"/>
+    <text class="et" x="228" y="286">done</text>
+
+    <rect class="b p" x="70" y="300" width="300" height="44"/>
+    <text class="lb" x="220" y="318">SYS_PLAN（system-test-planner）</text>
+    <text class="lb2" x="220" y="334">総合試験計画（期待値は [D:] トークンで）</text>
+    <path class="edge" d="M220,344 L220,372"/>
+    <text class="et" x="228" y="362">done</text>
+
+    <rect class="b rv" x="70" y="376" width="300" height="76"/>
+    <text class="lbr dl" x="220" y="396">SYS_REVIEW（system-test-plan-reviewer）</text>
+    <text class="lb2 dl" x="220" y="418">main → 観点サブ順次 → state保存 → integrator</text>
+    <text class="flat" x="220" y="440">FLAT: 3成分／軽量スキップ／waiver／rerun対応</text>
+    <rect class="b fx" x="490" y="392" width="180" height="44"/>
+    <text class="lb" x="580" y="410">SYS_FIX</text>
+    <text class="lb2" x="580" y="426">planner が直し切り</text>
+    <path class="eredge" d="M370,408 L486,408"/>
+    <text class="ng" x="400" y="402">high</text>
+    <path class="edge" d="M490,424 L374,424"/>
+    <text class="et" x="410" y="420">done→再レビュー</text>
+    <path class="edge" d="M220,452 L220,480"/>
+    <text class="ok" x="228" y="470">pass</text>
+
+    <rect class="b gl" x="70" y="484" width="300" height="44"/>
+    <text class="lb" x="220" y="502">REQ_GATE（gate-runner・軽量）</text>
+    <text class="lb2" x="220" y="518">trace_scan のみ＝exit code 判定</text>
+    <path class="eredge" d="M370,506 L688,506 L688,414 L670,414"/>
+    <text class="ng" x="600" y="500">high</text>
+    <path class="edge" d="M220,528 L220,556"/>
+    <text class="ok" x="228" y="546">pass</text>
+
+    <rect class="b p" x="70" y="560" width="300" height="44"/>
+    <text class="lb" x="220" y="578">DES_DRAFT / VERIFY / FINAL（designer）</text>
+    <text class="lb2" x="220" y="594">設計書.html＋design_spec.json（詳細は図2上段）</text>
+    <path class="edge" d="M220,604 L220,632"/>
+    <text class="et" x="228" y="622">done</text>
+
+    <rect class="b rv" x="70" y="636" width="300" height="76"/>
+    <text class="lbr dl" x="220" y="656">DES_REVIEW（design-reviewer）</text>
+    <text class="lb2 dl" x="220" y="678">main → 観点サブ順次 → state保存 → integrator</text>
+    <text class="flat" x="220" y="700">FLAT: 3成分／DES間依存の意味整合／waiver対応</text>
+    <rect class="b fx" x="490" y="652" width="180" height="44"/>
+    <text class="lb" x="580" y="670">DES_FIX</text>
+    <text class="lb2" x="580" y="686">designer が直し切り</text>
+    <path class="eredge" d="M370,668 L486,668"/>
+    <text class="ng" x="400" y="662">high</text>
+    <path class="edge" d="M490,684 L374,684"/>
+    <text class="et" x="410" y="680">done→再レビュー</text>
+    <path class="edge" d="M220,712 L220,740"/>
+    <text class="ok" x="228" y="730">pass</text>
+
+    <rect class="b p" x="70" y="744" width="300" height="44"/>
+    <text class="lb" x="220" y="762">INT_PLAN（integration-test-planner）</text>
+    <text class="lb2" x="220" y="778">結合試験計画</text>
+    <path class="edge" d="M220,788 L220,816"/>
+    <text class="et" x="228" y="806">done</text>
+
+    <rect class="b rv" x="70" y="820" width="300" height="76"/>
+    <text class="lbr dl" x="220" y="840">INT_REVIEW（integration-test-plan-reviewer）</text>
+    <text class="lb2 dl" x="220" y="862">main → 観点サブ順次 → state保存 → integrator</text>
+    <text class="flat" x="220" y="884">FLAT: 3成分／軽量スキップ／waiver／rerun対応</text>
+    <rect class="b fx" x="490" y="836" width="180" height="44"/>
+    <text class="lb" x="580" y="854">INT_FIX</text>
+    <text class="lb2" x="580" y="870">planner が直し切り</text>
+    <path class="eredge" d="M370,852 L486,852"/>
+    <text class="ng" x="400" y="846">high</text>
+    <path class="edge" d="M490,868 L374,868"/>
+    <text class="et" x="410" y="864">done→再レビュー</text>
+    <path class="edge" d="M220,896 L220,924"/>
+    <text class="ok" x="228" y="914">pass</text>
+
+    <rect class="b gl" x="70" y="928" width="300" height="44"/>
+    <text class="lb" x="220" y="946">DES_GATE（gate-runner・軽量）</text>
+    <text class="lb2" x="220" y="962">evidence/authenticity/ontology/trace＋spec_scan</text>
+    <path class="eredge" d="M370,950 L688,950 L688,674 L670,674"/>
+    <text class="ng" x="600" y="944">high</text>
+    <path class="edge" d="M220,972 L220,1000"/>
+    <text class="ok" x="228" y="990">pass</text>
+
+    <rect class="b p" x="70" y="1004" width="300" height="44"/>
+    <text class="lb" x="220" y="1022">BLD_IMPL（builder）</text>
+    <text class="lb2" x="220" y="1038">design_spec.json の IF どおり実装</text>
+    <path class="edge" d="M220,1048 L220,1076"/>
+    <text class="et" x="228" y="1066">done</text>
+
+    <rect class="b rv" x="70" y="1080" width="300" height="76"/>
+    <text class="lbr dl" x="220" y="1100">BLD_REVIEW（build-reviewer）</text>
+    <text class="lb2 dl" x="220" y="1122">main → 観点サブ×5 順次 → state保存 → integrator</text>
+    <text class="flat" x="220" y="1144">FLAT: 集約役サイクリング（019/020）の構造消滅</text>
+    <rect class="b fx" x="490" y="1096" width="180" height="44"/>
+    <text class="lb" x="580" y="1114">BLD_FIX</text>
+    <text class="lb2" x="580" y="1130">builder が直し切り</text>
+    <path class="eredge" d="M370,1112 L486,1112"/>
+    <text class="ng" x="400" y="1106">high</text>
+    <path class="edge" d="M490,1128 L374,1128"/>
+    <text class="et" x="410" y="1124">done→再レビュー</text>
+    <path class="edge" d="M220,1156 L220,1184"/>
+    <text class="ok" x="228" y="1174">pass</text>
+
+    <rect class="b p" x="70" y="1188" width="300" height="44"/>
+    <text class="lb" x="220" y="1206">UNIT_PLAN（unit-test-planner）</text>
+    <text class="lb2" x="220" y="1222">単体試験計画</text>
+    <path class="edge" d="M220,1232 L220,1260"/>
+    <text class="et" x="228" y="1250">done</text>
+
+    <rect class="b rv" x="70" y="1264" width="300" height="76"/>
+    <text class="lbr dl" x="220" y="1284">UNIT_REVIEW（unit-test-plan-reviewer）</text>
+    <text class="lb2 dl" x="220" y="1306">main → 観点サブ順次 → state保存 → integrator</text>
+    <text class="flat" x="220" y="1328">FLAT: 3成分／軽量スキップ／waiver／rerun対応</text>
+    <rect class="b fx" x="490" y="1280" width="180" height="44"/>
+    <text class="lb" x="580" y="1298">UNIT_FIX</text>
+    <text class="lb2" x="580" y="1314">planner が直し切り</text>
+    <path class="eredge" d="M370,1296 L486,1296"/>
+    <text class="ng" x="400" y="1290">high</text>
+    <path class="edge" d="M490,1312 L374,1312"/>
+    <text class="et" x="410" y="1308">done→再レビュー</text>
+    <path class="edge" d="M220,1340 L220,1368"/>
+    <text class="ok" x="228" y="1358">pass</text>
+
+    <rect class="b gh" x="70" y="1372" width="300" height="44"/>
+    <text class="lb" x="220" y="1390">BLD_GATE（consistency-checker・重）</text>
+    <text class="lb2" x="220" y="1406">スキャナ＋spec build（IF突合）＋trace_fill 実行</text>
+    <path class="eredge" d="M370,1394 L688,1394 L688,1118 L670,1118"/>
+    <text class="ng" x="600" y="1388">high</text>
+    <path class="edge" d="M220,1416 L220,1444"/>
+    <text class="ok" x="228" y="1434">pass</text>
+
+    <rect class="b p" x="70" y="1448" width="300" height="44"/>
+    <text class="lb" x="220" y="1466">T_UNIT（unit-tester）</text>
+    <text class="lb2" x="220" y="1482">機械記録を evidence/ に保存し宣言と突合</text>
+    <text class="ng" x="390" y="1472">ng → RCA（図3）</text>
+    <path class="edge" d="M220,1492 L220,1520"/>
+    <text class="ok" x="228" y="1510">pass</text>
+
+    <rect class="b p" x="70" y="1524" width="300" height="44"/>
+    <text class="lb" x="220" y="1542">T_INT（integration-tester）</text>
+    <text class="lb2" x="220" y="1558">実行証跡必須／回帰時は再実行 or ハッシュ免除</text>
+    <text class="ng" x="390" y="1548">ng → RCA（図3）</text>
+    <path class="edge" d="M220,1568 L220,1596"/>
+    <text class="ok" x="228" y="1586">pass</text>
+
+    <rect class="b p" x="70" y="1600" width="300" height="44"/>
+    <text class="lb" x="220" y="1618">T_SYS（system-tester）</text>
+    <text class="lb2" x="220" y="1634">利用者視点。自動不能分は AskUserQuestion で支援</text>
+    <text class="ng" x="390" y="1624">ng → RCA（図3）</text>
+    <path class="edge" d="M220,1644 L220,1672"/>
+    <text class="ok" x="228" y="1662">pass</text>
+
+    <rect class="b gh" x="70" y="1676" width="300" height="44"/>
+    <text class="lb" x="220" y="1694">T_GATE（consistency-checker・重）</text>
+    <text class="lb2" x="220" y="1710">result（フェンス除外）＋意味整合＋trace_fill 実行</text>
+    <text class="ng" x="390" y="1700">high → RCA（図3）</text>
+    <path class="edge" d="M220,1720 L220,1748"/>
+    <text class="ok" x="228" y="1738">pass</text>
+
+    <rect class="b p" x="70" y="1752" width="300" height="44"/>
+    <text class="lb" x="220" y="1770">LEARN（lessons-distiller）</text>
+    <text class="lb2" x="220" y="1786">教訓抽出 → 規約への差分提案</text>
+    <path class="edge" d="M220,1796 L220,1824"/>
+    <text class="et" x="228" y="1814">done</text>
+
+    <ellipse cx="220" cy="1854" rx="70" ry="22" fill="#3a4150"/>
+    <text class="lb" x="220" y="1852">DONE</text>
+    <text class="lb2" x="220" y="1868">終端</text>
+    <text class="ng" x="310" y="1854">変更要求 → change → RCA（図3）</text>
+    <text class="flat" x="310" y="1868">check_pending_changes.py で版突合</text>
+  </svg>
+  </div>
+  <p class="note">
+    <b>図1の補足（フラット化後）</b>: 状態機械のノード位相・遷移は v2/v3-current と完全に同じ。
+    変わるのは<b>5つの <code>*_REVIEW</code> ノードの内部フロー</b>のみで、集約役が観点サブを内部起動する多責務モデルから、
+    <b>main が観点サブを直列起動→state に結果を保存→integrator が state を読んで判定</b>という三段構成に変わる。
+    NODE_AGENT[BLD_REVIEW] 等は「build-reviewer」等の名前を保つが、責務が「集約役」から「integrator（判定＋記録のみ）」に縮小される。
+    ゲート・試験・LEARN・DONE の挙動は不変。DONE 到達時の変更要求検知は <code>check_pending_changes.py</code>（v3-current で導入）で決定論突合される。
+    詳細な内部フローは<b>図5</b>、集約役モデルとの比較は<b>図6</b>を参照。
+  </p>
+
+  <h2>図2: 設計の検証サブフロー と 再レビュー3成分＋waiver（integrator が担う）</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 720 620" role="img" aria-label="設計検証と再レビュー3成分（フラット化後）">
+    <style>
+      .b{rx:8}.p{fill:#1f6feb}.rv{fill:#d29922}.fx{fill:#da3633}.st{fill:#30363d;stroke:#5b6472}
+      .us{fill:#2ea043}
+      .lb{fill:#e8eaed;font-size:12px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.92}
+      .dl{fill:#1a1300}
+      .edge{stroke:#9aa4b2;stroke-width:1.6;fill:none;marker-end:url(#ah2)}
+      .eredge{stroke:#da3633;stroke-width:1.6;fill:none;marker-end:url(#ahr2);stroke-dasharray:5 4}
+      .et{fill:#9aa4b2;font-size:10.5px}.ok{fill:#2ea043;font-size:10.5px;font-weight:700}
+      .ng{fill:#da3633;font-size:10.5px;font-weight:700}
+      .cap{fill:#c9d4e3;font-size:12px;font-weight:700}
+      .flat{fill:#3fb950;font-size:10px;font-weight:700}
+    </style>
+    <defs>
+      <marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#9aa4b2"/></marker>
+      <marker id="ahr2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#da3633"/></marker>
+    </defs>
+
+    <text class="cap" x="16" y="24">（上段）設計の検証サブフロー</text>
+    <rect class="b p" x="16" y="40" width="200" height="44"/>
+    <text class="lb" x="116" y="58">DES_DRAFT</text>
+    <text class="lb2" x="116" y="74">第1R: [E?] マーク可＋spec 作成</text>
+    <rect class="b p" x="260" y="40" width="180" height="44"/>
+    <text class="lb" x="350" y="58">DES_VERIFY（verifier）</text>
+    <text class="lb2" x="350" y="74">[E?] を実機/資料で検証</text>
+    <rect class="b p" x="484" y="40" width="200" height="44"/>
+    <text class="lb" x="584" y="58">DES_FINAL</text>
+    <text class="lb2" x="584" y="74">[E_n] 確定＋render 更新</text>
+    <path class="edge" d="M216,56 L256,56"/>
+    <text class="et" x="222" y="50">verify</text>
+    <path class="edge" d="M440,56 L480,56"/>
+    <text class="ok" x="452" y="50">ok</text>
+    <path class="eredge" d="M350,84 C350,110 150,110 122,88"/>
+    <text class="ng" x="230" y="122">fail（差し戻し）</text>
+    <text class="et" x="16" y="112">[E?] が無ければ DRAFT から直接 done → DES_REVIEW</text>
+
+    <text class="cap" x="16" y="166">（下段）再レビュー3成分＋収束規律＋waiver（integrator が担う）</text>
+    <rect class="b st" x="16" y="184" width="200" height="48"/>
+    <text class="lb" x="116" y="202">前回レビュー記録</text>
+    <text class="lb2" x="116" y="218">指摘一覧が正本</text>
+    <rect class="b st" x="16" y="248" width="200" height="48"/>
+    <text class="lb" x="116" y="266">baseline（前回レビュー時点）</text>
+    <text class="lb2" x="116" y="282">save は担当レビュワーのみ</text>
+    <rect class="b st" x="16" y="312" width="200" height="48"/>
+    <text class="lb" x="116" y="330">決定論スキャナ</text>
+    <text class="lb2" x="116" y="346">trace / result / spec 等</text>
+
+    <rect class="b rv" x="280" y="184" width="240" height="48"/>
+    <text class="lb dl" x="400" y="202">(a) 指摘消込</text>
+    <text class="lb2 dl" x="400" y="218">1件ずつ現物で独立判定</text>
+    <rect class="b rv" x="280" y="248" width="240" height="48"/>
+    <text class="lb dl" x="400" y="266">(b) 機械diffで回帰確認</text>
+    <text class="lb2 dl" x="400" y="282">変更箇所＋影響範囲に全観点</text>
+    <rect class="b rv" x="280" y="312" width="240" height="48"/>
+    <text class="lb dl" x="400" y="330">(c) 形式確認は毎回全量</text>
+    <text class="lb2 dl" x="400" y="346">全体網羅は機械が担保</text>
+    <path class="edge" d="M216,208 L276,208"/>
+    <path class="edge" d="M216,272 L276,272"/>
+    <text class="et" x="222" y="266">diff</text>
+    <path class="edge" d="M216,336 L276,336"/>
+
+    <rect class="b rv" x="560" y="248" width="130" height="48"/>
+    <text class="lb dl" x="625" y="266">integrator</text>
+    <text class="lb2 dl" x="625" y="282">pass / high / rerun</text>
+    <path class="edge" d="M520,208 C548,208 548,262 556,262"/>
+    <path class="edge" d="M520,272 L556,272"/>
+    <path class="edge" d="M520,336 C548,336 548,282 556,282"/>
+
+    <text class="cap flat" x="16" y="400">FLAT: 3成分は integrator が担う（集約役の launch 責務は main へ移動）</text>
+    <text class="et" x="16" y="422">・rerun は observer 単位で指定可能（他 observer の結果は state から再利用＝細粒度スキップ）</text>
+    <text class="et" x="16" y="440">・review_round&gt;3 のままの pass は hook_check_advance_actor が deny（waiver で許可）</text>
+    <text class="et" x="16" y="458">・full 再読は「初回／baseline 無し／変更が全体の3割超」のみ</text>
+    <text class="et" x="16" y="476">・save は担当レビュワー（integrator）専有・hook 検証</text>
+    <text class="et" x="16" y="494">・追認防止: 是正者の主張は受け取らない／機械 diff は改竄不能な中立事実</text>
+    <text class="flat" x="16" y="516">FLAT: 「集約役 → 観点サブへの委任の中立性」ルールが main の SKILL.md へ移動</text>
+    <text class="flat" x="16" y="534">FLAT: 軽量スキップ（試験計画レビュー系のみ）は integrator が state を見て判定</text>
+  </svg>
+  </div>
+
+  <h2>図3: RCA 回帰マップ と デルタフロー（v3-current と同一）</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 720 500" role="img" aria-label="RCA回帰とデルタフロー">
+    <style>
+      .b{rx:8}.p{fill:#1f6feb}.fx{fill:#da3633}.us{fill:#2ea043}.st{fill:#30363d;stroke:#5b6472}
+      .rca{fill:#b62324}
+      .lb{fill:#e8eaed;font-size:12px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.92}
+      .edge{stroke:#9aa4b2;stroke-width:1.6;fill:none;marker-end:url(#ah3)}
+      .eredge{stroke:#da3633;stroke-width:1.6;fill:none;marker-end:url(#ahr3);stroke-dasharray:5 4}
+      .et{fill:#9aa4b2;font-size:10.5px}
+      .ng{fill:#da3633;font-size:10.5px;font-weight:700}
+      .cap{fill:#c9d4e3;font-size:12px;font-weight:700}
+      .flat{fill:#3fb950;font-size:10px;font-weight:700}
+    </style>
+    <defs>
+      <marker id="ah3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#9aa4b2"/></marker>
+      <marker id="ahr3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#da3633"/></marker>
+    </defs>
+
+    <rect class="b st" x="30" y="24" width="180" height="40"/>
+    <text class="lb" x="120" y="41">T_UNIT / T_INT / T_SYS</text>
+    <text class="lb2" x="120" y="56">試験 NG</text>
+    <rect class="b st" x="260" y="24" width="140" height="40"/>
+    <text class="lb" x="330" y="41">T_GATE</text>
+    <text class="lb2" x="330" y="56">high</text>
+    <rect class="b st" x="450" y="24" width="240" height="52"/>
+    <text class="lb" x="570" y="41">DONE ＋ 変更要求</text>
+    <text class="lb2" x="570" y="56">change（デルタフロー・R3）</text>
+    <text class="flat" x="570" y="72">check_pending_changes.py</text>
+    <path class="eredge" d="M120,64 C120,110 300,110 336,128"/>
+    <path class="eredge" d="M330,64 L348,124"/>
+    <path class="eredge" d="M570,76 C570,110 420,110 384,128"/>
+
+    <rect class="b rca" x="230" y="130" width="240" height="64"/>
+    <text class="lb" x="350" y="152">RCA（root-cause-analyzer・Opus）</text>
+    <text class="lb2" x="350" y="168">最小原因の特定／変更モードでは影響集合の特定と</text>
+    <text class="lb2" x="350" y="182">受理記録（変更要望書の版を転記）→ 入口層判定</text>
+
+    <rect class="b us" x="16" y="270" width="150" height="48"/>
+    <text class="lb" x="91" y="288">REQ_APPROVE</text>
+    <text class="lb2" x="91" y="304">req: 要件が矛盾/変更</text>
+    <rect class="b fx" x="182" y="270" width="120" height="48"/>
+    <text class="lb" x="242" y="288">DES_FIX</text>
+    <text class="lb2" x="242" y="304">design: 設計欠陥</text>
+    <rect class="b fx" x="318" y="270" width="120" height="48"/>
+    <text class="lb" x="378" y="288">BLD_FIX</text>
+    <text class="lb2" x="378" y="304">impl: 実装欠陥</text>
+    <rect class="b p" x="454" y="270" width="110" height="48"/>
+    <text class="lb" x="509" y="288">T_UNIT</text>
+    <text class="lb2" x="509" y="304">test: 結果/ハーネス</text>
+    <rect class="b fx" x="580" y="270" width="104" height="48"/>
+    <text class="lb" x="632" y="288">*_FIX（計画）</text>
+    <text class="lb2" x="632" y="304">unitplan/intplan/sysplan</text>
+
+    <path class="edge" d="M290,194 C200,220 120,240 95,266"/>
+    <text class="et" x="150" y="238">req</text>
+    <path class="edge" d="M320,194 C290,225 260,245 245,266"/>
+    <text class="et" x="268" y="240">design</text>
+    <path class="edge" d="M355,194 L378,266"/>
+    <text class="et" x="372" y="240">impl</text>
+    <path class="edge" d="M400,194 C460,225 495,245 507,266"/>
+    <text class="et" x="466" y="240">test</text>
+    <path class="edge" d="M440,194 C560,220 615,240 630,266"/>
+    <text class="et" x="570" y="236">計画の期待値誤り</text>
+
+    <text class="et" x="16" y="356">回帰後は前進経路が構造的に強制される: 是正 → 再レビュー（3成分＝機械diff）→ ゲート →</text>
+    <text class="et" x="16" y="374">以降の全テストレベル再通過（src 無変更ならハッシュ免除を記録して通過）。</text>
+    <text class="ng" x="16" y="404">デルタフローの経済性: 変更の無い成果物の再レビューは diff 空振り・試験はハッシュ免除。</text>
+    <text class="flat" x="16" y="426">FLAT: この図の内容は v3-current と同一（RCA・デルタフローの構造は変わらない）</text>
+  </svg>
+  </div>
+
+  <h2>図4: フック配置と発火タイミング（フラット化後）</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 720 620" role="img" aria-label="フック配置（フラット化後）">
+    <style>
+      .b{rx:8}
+      .h1{fill:#8957e5}.h2c{fill:#6639ba}.h3c{fill:#1f6feb}.h4c{fill:#b62324}.h5c{fill:#2ea043}
+      .st{fill:#30363d;stroke:#5b6472}
+      .lb{fill:#e8eaed;font-size:12px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.94}
+      .lbl{fill:#eef3fa;font-size:10.5px}
+      .cap{fill:#c9d4e3;font-size:12px;font-weight:700}
+      .flat{fill:#3fb950;font-size:9px;font-weight:700}
+      .del{fill:#da3633;font-size:9px;font-weight:700}
+    </style>
+
+    <text class="cap" x="16" y="24">Claude Code イベント → 発火するhook（左）／守る資産（右）</text>
+
+    <rect class="b h1" x="16" y="40" width="220" height="80"/>
+    <text class="lb" x="126" y="58">PreToolUse: Edit|Write|MultiEdit</text>
+    <text class="lb2" x="126" y="76">hook_check_protected_path</text>
+    <text class="lb2" x="126" y="90">hook_check_delegated_write</text>
+    <text class="lb2" x="126" y="104">hook_check_state_write</text>
+    <text class="lb2" x="126" y="118">（変更なし）</text>
+    <rect class="b st" x="280" y="40" width="424" height="80"/>
+    <text class="lbl" x="292" y="58">docs/**（フェーズ別）・src/**・state/_*（governance）</text>
+    <text class="lbl flat" x="292" y="76">FLAT: state/review_results/&lt;NODE&gt;.jsonl（アンダースコア無し・main書込可）</text>
+    <text class="lbl" x="292" y="94">→ hook_check_state_write の GOVERNANCE_BASENAMES に当たらない</text>
+    <text class="lbl" x="292" y="112">（既存 governance ファイルは main の Write/Edit を deny のまま）</text>
+
+    <rect class="b h2c" x="16" y="136" width="220" height="120"/>
+    <text class="lb" x="126" y="154">PreToolUse: Bash</text>
+    <text class="lb2" x="126" y="172">hook_check_commit_agent</text>
+    <text class="lb2" x="126" y="186">hook_check_advance_actor</text>
+    <text class="lb2" x="126" y="200">├ advance実行主体検証</text>
+    <text class="lb2" x="126" y="214">├ baseline save主体検証</text>
+    <text class="lb2" x="126" y="228">├ 収束規律（round&gt;3のpassをdeny）</text>
+    <text class="lb2 flat" x="126" y="242">└ FLAT: rerun 実行主体検証（main専用）</text>
+    <rect class="b st" x="280" y="136" width="424" height="120"/>
+    <text class="lbl" x="292" y="154">manage_flow_state.py advance ...（役割またぎ・メイン advance を deny）</text>
+    <text class="lbl" x="292" y="172">manage_review_baseline.py save ...（担当レビュワー専用）</text>
+    <text class="lbl" x="292" y="190">trace_fill.py（consistency-checker 専用）</text>
+    <text class="lbl flat" x="292" y="208">FLAT: check_rerun_limit.py（main専用・integratorのrerun判定を機械化）</text>
+    <text class="lbl flat" x="292" y="226">FLAT: state/review_results/&lt;NODE&gt;.jsonl への append（main専用）</text>
+    <text class="lbl" x="292" y="244">git commit → committer 専用</text>
+
+    <rect class="b h3c" x="16" y="272" width="220" height="120"/>
+    <text class="lb" x="126" y="290">PreToolUse: Task|Agent</text>
+    <text class="lb2 del" x="126" y="308">DEL: 集約役のBG起動禁止</text>
+    <text class="lb2 del" x="126" y="322">DEL: 逆委任ガード（NODE_AGENT値集合）</text>
+    <text class="lb2 flat" x="126" y="340">FLAT: サブ→任意のサブを無条件 deny</text>
+    <text class="lb2" x="126" y="356">（agent_type 付きの Task|Agent 呼び出し）</text>
+    <text class="lb2" x="126" y="374">hook_log_agent（維持・by=main のみ記録）</text>
+    <rect class="b st" x="280" y="272" width="424" height="120"/>
+    <text class="lbl flat" x="292" y="290">FLAT: サブエージェントは他のサブを起動できない（例外なし）</text>
+    <text class="lbl" x="292" y="308">→ 020 で発覚した集約役サイクリング問題の再発を構造的に防止</text>
+    <text class="lbl" x="292" y="326">→ プラグイン全体の不変条件として明文化</text>
+    <text class="lbl del" x="292" y="344">DEL: run_in_background 特例（不要になる）</text>
+    <text class="lbl del" x="292" y="362">DEL: NODE_AGENT 値集合チェック（無条件禁止で代替）</text>
+    <text class="lbl" x="292" y="380">起動記録は今まで通り _agent_invocations.jsonl（by=main が支配的に）</text>
+
+    <rect class="b h4c" x="16" y="408" width="220" height="100"/>
+    <text class="lb" x="126" y="426">SubagentStop</text>
+    <text class="lb2" x="126" y="444">hook_enforce_advance</text>
+    <text class="lb2" x="126" y="458">├ advance漏れ検知→ block</text>
+    <text class="lb2 del" x="126" y="472">DEL: children-running 判定</text>
+    <text class="lb2" x="126" y="486">├ stop_hook_active（維持）</text>
+    <text class="lb2" x="126" y="500">├ block_cap=2（保険として維持）</text>
+    <rect class="b st" x="280" y="408" width="424" height="100"/>
+    <text class="lbl" x="292" y="426">サブエージェントが担当ノードの advance を実行せず停止 → block</text>
+    <text class="lbl del" x="292" y="444">DEL: background_tasks 参照（サブ→サブ禁止で構造的に不要）</text>
+    <text class="lbl" x="292" y="462">→ サブ→サブ起動が禁止されるので、children_running は発生しない</text>
+    <text class="lbl" x="292" y="480">エスカレーション書式は素通し（要ユーザー判断＋該当基準）</text>
+    <text class="lbl" x="292" y="498">block_cap=2 は defense in depth として維持（想定外の停止ループ保険）</text>
+
+    <rect class="b h5c" x="16" y="524" width="220" height="80"/>
+    <text class="lb" x="126" y="542">Stop（メインセッション）</text>
+    <text class="lb2" x="126" y="560">hook_continue_flow</text>
+    <text class="lb2" x="126" y="576">（変更なし）</text>
+    <text class="lb2" x="126" y="590">STALL_CAP=25／HARD_CAP=200</text>
+    <rect class="b st" x="280" y="524" width="424" height="80"/>
+    <text class="lbl" x="292" y="542">オーケストレーターの裸ターン終了を検知して継続強制</text>
+    <text class="lbl" x="292" y="560">（フラット化で main の役割が増えても Stop hook の仕事は変わらない）</text>
+    <text class="lbl" x="292" y="578">進捗の無い滞留に対する保険は既存通り</text>
+  </svg>
+  </div>
+
+  <h2>図5: レビューノード内部フロー（フラット化後・詳細）</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 900 720" role="img" aria-label="フラット化後のレビュー内部フロー">
+    <defs>
+      <marker id="ah5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#9aa4b2"/></marker>
+      <marker id="ahg5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#3fb950"/></marker>
+      <marker id="ahr5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#da3633"/></marker>
+    </defs>
+    <style>
+      .b{rx:8}
+      .p{fill:#1f6feb}.rv{fill:#d29922}.st{fill:#30363d;stroke:#5b6472}
+      .obs{fill:#4a5568}.integ{fill:#b62324}.script{fill:#8957e5}.us{fill:#2ea043}.fx{fill:#da3633}
+      .lb{fill:#e8eaed;font-size:12px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.94}
+      .dl{fill:#1a1300}
+      .edge{stroke:#9aa4b2;stroke-width:1.6;fill:none;marker-end:url(#ah5)}
+      .gedge{stroke:#3fb950;stroke-width:2;fill:none;marker-end:url(#ahg5)}
+      .eredge{stroke:#da3633;stroke-width:1.6;fill:none;marker-end:url(#ahr5);stroke-dasharray:5 4}
+      .et{fill:#9aa4b2;font-size:10.5px}.ok{fill:#2ea043;font-size:10.5px;font-weight:700}
+      .ng{fill:#da3633;font-size:10.5px;font-weight:700}
+      .cap{fill:#c9d4e3;font-size:12.5px;font-weight:700}
+      .flat{fill:#3fb950;font-size:9.5px;font-weight:700}
+    </style>
+
+    <text class="cap" x="16" y="24">BLD_REVIEW（例）に入った時の main の内部処理シーケンス。他のレビューも同型。</text>
+
+    <rect class="b p" x="30" y="52" width="180" height="44"/>
+    <text class="lb" x="120" y="70">main（ディスパッチャ）</text>
+    <text class="lb2" x="120" y="86">state で current=BLD_REVIEW を確認</text>
+
+    <rect class="b st" x="260" y="52" width="200" height="44"/>
+    <text class="lb" x="360" y="70">reviewers.json の "build"</text>
+    <text class="lb2" x="360" y="86">列挙された観点サブの順序</text>
+    <path class="edge" d="M210,74 L256,74"/>
+    <text class="et" x="220" y="66">読む</text>
+
+    <rect class="b obs" x="510" y="52" width="360" height="80"/>
+    <text class="lb" x="690" y="70">観点サブ i を Task で起動（i = 1..N）</text>
+    <text class="lb2" x="690" y="86">対象成果物＋機械diff＋前回指摘一覧</text>
+    <text class="lb2" x="690" y="100">（是正者の主張・他観点の結果は渡さない＝中立）</text>
+    <text class="lb2" x="690" y="116">Task は synchronous（main の context に結果が返る）</text>
+    <path class="edge" d="M460,74 L506,74"/>
+    <text class="et" x="470" y="66">順序取得</text>
+
+    <rect class="b p" x="510" y="146" width="360" height="60"/>
+    <text class="lb" x="690" y="164">main が Bash で state に append</text>
+    <text class="flat" x="690" y="180">FLAT: state/review_results/BLD_REVIEW.jsonl</text>
+    <text class="lb2" x="690" y="196">{round, perspective, at, result} を1行追記</text>
+    <path class="edge" d="M690,132 L690,144"/>
+    <text class="et" x="700" y="140">結果</text>
+
+    <path class="edge" d="M508,176 L490,176 L490,74 L506,74"/>
+    <text class="et" x="380" y="145">i &lt; N なら次の観点へ（直列）</text>
+
+    <rect class="b integ" x="30" y="230" width="440" height="70"/>
+    <text class="lb" x="250" y="248">integrator（旧・build-reviewer）</text>
+    <text class="flat" x="250" y="264">FLAT: state/review_results/&lt;NODE&gt; を読んで判定</text>
+    <text class="lb2" x="250" y="280">全観点の結果を統合・重複排除・重要度整理</text>
+    <text class="lb2" x="250" y="296">戻り値: pass / high / rerun（対象と理由を含む）</text>
+    <path class="edge" d="M690,206 L690,215 L470,215 L470,240 L466,240"/>
+    <text class="et" x="500" y="222">全観点完了</text>
+
+    <text class="cap" x="16" y="330">integrator の判定 → main の対応</text>
+
+    <rect class="b rv" x="30" y="346" width="180" height="70"/>
+    <text class="lb dl" x="120" y="364">decision = pass</text>
+    <text class="lb2 dl" x="120" y="380">integrator が</text>
+    <text class="lb2 dl" x="120" y="394">レビュー記録.md 作成</text>
+    <text class="lb2 dl" x="120" y="410">→ advance BLD_REVIEW pass</text>
+
+    <rect class="b rv" x="230" y="346" width="180" height="70"/>
+    <text class="lb dl" x="320" y="364">decision = high</text>
+    <text class="lb2 dl" x="320" y="380">integrator が</text>
+    <text class="lb2 dl" x="320" y="394">レビュー記録.md（指摘含む）</text>
+    <text class="lb2 dl" x="320" y="410">→ advance BLD_REVIEW high</text>
+
+    <rect class="b script" x="430" y="346" width="200" height="70"/>
+    <text class="lb" x="530" y="364">decision = rerun</text>
+    <text class="flat" x="530" y="380">FLAT: main が</text>
+    <text class="lb2" x="530" y="394">check_rerun_limit.py &lt;node&gt; 実行</text>
+    <text class="lb2" x="530" y="410">上限内=対象観点だけ再launch</text>
+
+    <rect class="b us" x="650" y="346" width="220" height="70"/>
+    <text class="lb" x="760" y="364">rerun 上限超過</text>
+    <text class="flat" x="760" y="380">FLAT: check_rerun_limit.py exit 1</text>
+    <text class="lb2" x="760" y="394">main が AskUserQuestion</text>
+    <text class="lb2" x="760" y="410">続行/免除/方針変更を諮る</text>
+
+    <path class="edge" d="M250,300 L120,346"/>
+    <path class="edge" d="M250,300 L320,346"/>
+    <path class="edge" d="M250,300 L530,346"/>
+    <text class="ok" x="140" y="336">pass</text>
+    <text class="ng" x="315" y="336">high</text>
+    <text class="et" x="490" y="336">rerun</text>
+
+    <path class="gedge" d="M530,416 L530,440 L690,440 L690,132"/>
+    <text class="flat" x="540" y="460">rerun 対象の観点だけ Task で再起動</text>
+    <text class="flat" x="540" y="476">（他は state の前回結果を integrator が再利用）</text>
+
+    <path class="eredge" d="M630,382 L648,382"/>
+    <text class="ng" x="638" y="376">超過</text>
+
+    <rect class="b fx" x="230" y="490" width="180" height="44"/>
+    <text class="lb" x="320" y="508">BLD_FIX（builder）</text>
+    <text class="lb2" x="320" y="524">未是正の高を1回で直し切り</text>
+    <path class="eredge" d="M320,416 L320,488"/>
+    <text class="ng" x="330" y="455">高指摘残</text>
+
+    <path class="eredge" d="M320,534 L320,560 L690,560 L690,180"/>
+    <text class="et" x="480" y="580">done → BLD_REVIEW 第2ラウンド（review_results を rotate、round+=1）</text>
+
+    <text class="cap" x="16" y="620">構造上の効果</text>
+    <text class="et" x="16" y="642">・main の Task 呼び出しは synchronous なので、observer 結果は同じターン内で main に返る（子完了通知の親不到達問題なし）</text>
+    <text class="et" x="16" y="660">・main は永続的なオーケストレーターとして観点順序を保持（fresh 再起動でも state から再開可能）</text>
+    <text class="et" x="16" y="678">・rerun は「必要な観点だけ」で完了する（前回結果は state に残るので再利用）＝細粒度スキップ</text>
+    <text class="flat" x="16" y="700">・integrator も stateless だが、state を読むだけの単機能なので過去状態を持つ必要がない</text>
+  </svg>
+  </div>
+
+  <h2>図6: 集約役モデル vs integrator モデル 構造差分</h2>
+  <div class="wrap">
+  <svg viewBox="0 0 900 620" role="img" aria-label="集約役モデル vs integrator モデル">
+    <style>
+      .b{rx:8}
+      .p{fill:#1f6feb}.rv{fill:#d29922}
+      .obs{fill:#4a5568}.integ{fill:#b62324}.main{fill:#1f6feb}
+      .lb{fill:#e8eaed;font-size:12px;font-weight:600;text-anchor:middle}
+      .lb2{fill:#eef3fa;font-size:10px;text-anchor:middle;opacity:.94}
+      .dl{fill:#1a1300}
+      .edge{stroke:#9aa4b2;stroke-width:1.6;fill:none;marker-end:url(#ah6)}
+      .aedge{stroke:#f78166;stroke-width:2;fill:none;marker-end:url(#aha6);stroke-dasharray:6 4}
+      .redge{stroke:#3fb950;stroke-width:1.8;fill:none;marker-end:url(#ahg6)}
+      .cap{fill:#c9d4e3;font-size:13px;font-weight:700}
+      .flat{fill:#3fb950;font-size:10px;font-weight:700}
+      .old{fill:#f78166;font-size:10px;font-weight:700}
+      .et{fill:#9aa4b2;font-size:10.5px}
+    </style>
+    <defs>
+      <marker id="ah6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#9aa4b2"/></marker>
+      <marker id="aha6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#f78166"/></marker>
+      <marker id="ahg6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#3fb950"/></marker>
+    </defs>
+
+    <text class="cap old" x="16" y="24">現行: 集約役モデル（v2/v3-current）</text>
+    <text class="et" x="16" y="44">main → 集約役 → 観点サブ×N（内包）</text>
+
+    <rect class="b main" x="30" y="60" width="200" height="40"/>
+    <text class="lb" x="130" y="82">main</text>
+
+    <rect class="b rv" x="30" y="130" width="200" height="70"/>
+    <text class="lb dl" x="130" y="148">集約役（build-reviewer 等）</text>
+    <text class="lb2 dl" x="130" y="164">① reviewers.json 読む</text>
+    <text class="lb2 dl" x="130" y="178">② 観点サブ launch</text>
+    <text class="lb2 dl" x="130" y="192">③④⑤ 統合・記録・advance</text>
+
+    <rect class="b obs" x="30" y="240" width="60" height="40"/>
+    <text class="lb" x="60" y="262">obs1</text>
+    <rect class="b obs" x="100" y="240" width="60" height="40"/>
+    <text class="lb" x="130" y="262">obs2</text>
+    <rect class="b obs" x="170" y="240" width="60" height="40"/>
+    <text class="lb" x="200" y="262">obsN</text>
+
+    <path class="aedge" d="M130,100 L130,128"/>
+    <text class="old" x="140" y="118">Task</text>
+    <path class="aedge" d="M130,200 L60,238"/>
+    <path class="aedge" d="M130,200 L130,238"/>
+    <path class="aedge" d="M130,200 L200,238"/>
+
+    <text class="old" x="16" y="320">問題:</text>
+    <text class="et" x="16" y="338">・集約役の Task 呼び出しは非同期扱い→子の完了通知は main へ届く</text>
+    <text class="et" x="16" y="356">・集約役は Task 直後に停止し、次呼び出しは fresh 再起動</text>
+    <text class="et" x="16" y="374">・fresh 集約役は過去の観点結果を持たない→観点1から launch し直す</text>
+    <text class="et" x="16" y="392">・BLD_REVIEW サイクリング（019/020 で実発生・約 90〜120分停滞）</text>
+
+    <text class="cap flat" x="470" y="24">現行: integrator モデル（v3-current）</text>
+    <text class="et" x="470" y="44">main → 観点サブ×N（直列）→ integrator</text>
+
+    <rect class="b main" x="470" y="60" width="400" height="60"/>
+    <text class="lb" x="670" y="80">main（永続オーケストレーター）</text>
+    <text class="lb2" x="670" y="96">reviewers.json 読み・観点順序制御・state 書込・</text>
+    <text class="lb2" x="670" y="110">integrator 起動・rerun 判定（check_rerun_limit.py）</text>
+
+    <rect class="b obs" x="470" y="150" width="80" height="40"/>
+    <text class="lb" x="510" y="172">obs1</text>
+    <rect class="b obs" x="565" y="150" width="80" height="40"/>
+    <text class="lb" x="605" y="172">obs2</text>
+    <rect class="b obs" x="660" y="150" width="80" height="40"/>
+    <text class="lb" x="700" y="172">obs3</text>
+    <rect class="b obs" x="785" y="150" width="80" height="40"/>
+    <text class="lb" x="825" y="172">obsN</text>
+
+    <path class="redge" d="M510,120 L510,148"/>
+    <path class="redge" d="M605,120 L605,148"/>
+    <path class="redge" d="M700,120 L700,148"/>
+    <path class="redge" d="M825,120 L825,148"/>
+    <text class="flat" x="488" y="140">順次</text>
+
+    <path class="edge" d="M510,190 L510,215 L668,215 L668,124" stroke-dasharray="3 3"/>
+    <text class="et" x="530" y="212">Task 結果</text>
+
+    <rect class="b" x="500" y="230" width="360" height="50" fill="#30363d" stroke="#5b6472"/>
+    <text class="lb" x="680" y="248">state/review_results/BLD_REVIEW.jsonl</text>
+    <text class="flat" x="680" y="264">FLAT: main が Task 結果を受領後 Bash で append</text>
+    <path class="redge" d="M680,120 L680,228"/>
+    <text class="flat" x="686" y="215">書込</text>
+
+    <rect class="b integ" x="500" y="310" width="360" height="66"/>
+    <text class="lb" x="680" y="328">integrator（旧 build-reviewer 等・責務縮小）</text>
+    <text class="lb2" x="680" y="344">state を Bash で読み・全観点統合・判定</text>
+    <text class="lb2" x="680" y="360">レビュー記録.md 作成・advance 実行</text>
+    <text class="flat" x="680" y="374">戻り値: pass / high / rerun</text>
+    <path class="redge" d="M680,280 L680,308"/>
+
+    <path class="redge" d="M500,340 L440,340 L440,120 L500,120"/>
+    <text class="flat" x="428" y="232">rerun</text>
+
+    <text class="flat" x="470" y="420">効果:</text>
+    <text class="et" x="470" y="438">・main は synchronous な Task 呼び出しで observer 結果を確実に受領</text>
+    <text class="et" x="470" y="456">・観点結果は state に保存＝セッション中断耐性・監査可能</text>
+    <text class="et" x="470" y="474">・integrator は state を読むだけの単機能・過去状態を持つ必要なし</text>
+    <text class="et" x="470" y="492">・rerun は必要な観点のみ再launch（細粒度スキップ）</text>
+    <text class="et" x="470" y="510">・集約役のサイクリング問題が構造消滅</text>
+
+    <text class="cap" x="16" y="548">両モデル共通で維持されるもの</text>
+    <text class="et" x="16" y="566">・状態機械（NODE_AGENT／TRANSITIONS）は完全に不変</text>
+    <text class="et" x="16" y="582">・再レビュー3成分モデル・軽量スキップ・waiver 経路は integrator 側で維持</text>
+    <text class="et" x="16" y="600">・review_round の上限規律（hook_check_advance_actor.evaluate_review_round）は不変</text>
+  </svg>
+  </div>
+
+  <h2>影響を受けるファイル一覧</h2>
+  <table>
+    <tr><th>ファイル</th><th>変更種別</th><th>主な変更内容</th></tr>
+    <tr><td>plugins/ccd-flowkit/skills/run/SKILL.md</td><td>更新</td><td>*_REVIEW ノードで観点サブを直列起動→state 保存→integrator 起動する制御ロジックを追加。中立性ルールを main へ移動。</td></tr>
+    <tr><td>plugins/ccd-flowkit/agents/build-reviewer.md ほか集約役5体</td><td>更新（責務縮小）</td><td>observer launch 責務を削除。state 読取＋統合＋レビュー記録＋advance のみに縮小。<code>tools</code> から Task を削除。</td></tr>
+    <tr><td>plugins/ccd-flowkit/references/reviewers.json</td><td>不変（意味変更）</td><td>スキーマ不変。ただし解釈が「集約役が launch する対象」から「main が順次 launch する対象」に変わる。</td></tr>
+    <tr><td>plugins/ccd-flowkit/references/review-conventions.md</td><td>更新</td><td>中立性ルールの適用先を集約役→main に変更。3成分モデルの記述は不変。</td></tr>
+    <tr><td>plugins/ccd-flowkit/scripts/hook_check_subagent_launch.py</td><td>簡素化</td><td>集約役BG起動禁止・逆委任ガードを削除し、agent_type付き Task|Agent 呼び出しを無条件 deny に一般化。</td></tr>
+    <tr><td>plugins/ccd-flowkit/scripts/hook_enforce_advance.py</td><td>簡素化</td><td>children_running allow を削除。block_cap=2 は維持。</td></tr>
+    <tr><td>plugins/ccd-flowkit/scripts/hook_check_advance_actor.py</td><td>拡張</td><td>evaluate_rerun_actor 追加（check_rerun_limit.py と state/review_results/ 書込を main 専用に限定）。</td></tr>
+    <tr><td>plugins/ccd-flowkit/scripts/check_rerun_limit.py（新規）</td><td>新規</td><td>_advance_audit.jsonl から現ラウンドの rerun 回数を集計。上限内=exit 0、超過=exit 1（AskUserQuestion 促し）。</td></tr>
+    <tr><td>plugins/ccd-flowkit/scripts/manage_flow_state.py</td><td>更新</td><td><code>RERUN_LIMIT_PER_ROUND = 2</code> を正本化。</td></tr>
+    <tr><td>state/review_results/&lt;NODE&gt;.jsonl（新規）</td><td>新規</td><td>各観点サブの結果を追記。round 単位で main が rotate。</td></tr>
+    <tr><td>tests/rp-test-output/*/scorecard.json 比較</td><td>互換</td><td>評価基準（req_satisfaction ほか6観点）不変。<code>_agent_invocations.jsonl</code> の <code>by</code> フィールドが集約役→main に変わるが集計方法は既存互換。</td></tr>
+  </table>
+
+  <h2>削除される機構（フラット化完成後の別PRで実施）</h2>
+  <ul class="del">
+    <li>hook_enforce_advance.children_running 判定と background_tasks 参照（サブ→サブ起動禁止で構造的に不要化）</li>
+    <li>hook_check_subagent_launch の run_in_background 特例（集約役が観点サブを起動しない）</li>
+    <li>hook_check_subagent_launch の逆委任ガード（NODE_AGENT 値集合チェック→無条件禁止に一般化）</li>
+    <li>各集約役 md の「直列起動明文化」「echo waiting 禁止」等の launch 責務関連の全記述</li>
+    <li>build-reviewer.md 等5体の <code>tools</code> から Task 権限（integrator は launch しない）</li>
+    <li>review-conventions.md の「集約役が観点サブへ委任するときの中立性ルール」→ main の SKILL.md に移動</li>
+  </ul>
+
+  <h2>変更されない機構</h2>
+  <ul>
+    <li>状態機械（NODE_AGENT／TRANSITIONS・state/_flow_state.json のスキーマ）</li>
+    <li>再レビュー3成分モデル（前回指摘＋機械diff＋決定論スキャナ）</li>
+    <li>収束規律 hook（review_round&gt;3 のpassをdeny・waiver経路）</li>
+    <li>軽量スキップ（試験計画レビュー系のみ・baseline unchanged+高0件で全省略）</li>
+    <li>RCA 7 outcome＋デルタフロー（check_pending_changes.py で版突合）</li>
+    <li>trace_fill.py（consistency-checker が BLD_GATE/T_GATE で実行）</li>
+    <li>ゲート2種（軽量: gate-runner／重: consistency-checker）</li>
+    <li>編集剥奪原則（main は docs/** に書けない・state governance）</li>
+  </ul>
+
+  <h2>フラット化モデルの構成要素</h2>
+  <ol style="color:#b8c2d0;font-size:12.5px;line-height:1.75">
+    <li><b>state/review_results/&lt;NODE&gt;.jsonl</b>: 観点サブの結果を保存するファイル（main が Bash append で書込、integrator が Bash で読取）。</li>
+    <li><b>integrator（レビュワー）</b>: state を読んで統合＋判定＋advance するのみ（Task ツールを持たない・観点サブの起動責務なし）。5レビューノード（SYS/DES/INT/BLD/UNIT_REVIEW）全てで採用。</li>
+    <li><b>reviewers.json のキー体系</b>: `sys_review` / `des_review` / `int_review` / `bld_review` / `unit_review`（ノード名の小文字形と一致）。</li>
+    <li><b>check_rerun_limit.py</b>: integrator の rerun 要求を機械的に上限判定（RERUN_LIMIT_PER_ROUND=2）。超過時は main が AskUserQuestion でユーザーに諮る（強制収束はしない）。</li>
+    <li><b>hook_check_subagent_launch</b>: 「agent_type 付き Task|Agent は無条件 deny」に一般化（サブ→サブ起動を不変条件として禁止）。</li>
+    <li><b>hook_check_state_write.evaluate_review_results</b>: state/review_results/*.jsonl への Write/Edit を main 専用に限定（Bash 側の evaluate_rerun_actor と対称）。</li>
+    <li><b>hook_check_advance_actor.evaluate_rerun_actor</b>: rerun / review_results 書込の実行主体を main に限定。</li>
+  </ol>
+
+  <div class="warn">
+    <b>リスクと軽減策</b>: フラット化は状態機械を変えないが、main の SKILL.md 制御ロジックが増える。
+    main のプロンプト複雑化を機械化スクリプト（<code>check_rerun_limit.py</code>・将来的な <code>next_reviewer.py</code>）で吸収する。
+    比較の基盤（scorecard 6観点）は不変。
+  </div>
+</body>
+</html>

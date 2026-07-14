@@ -1,0 +1,28 @@
+{
+  "_note": "各レビューノードで起動する観点サブエージェント名を列挙する（キー名はノード名の小文字形に統一・main が node.lower() でキー引き）。自作・公式・独自を自由に追加/削除できる。独自を足す場合は .claude/agents/ にエージェントを置き、その name をここに追加する。",
+  "sys_review": {
+    "subagents": ["test-plan-convention-reviewer"]
+  },
+  "des_review": {
+    "subagents": ["design-convention-reviewer"]
+  },
+  "int_review": {
+    "subagents": ["test-plan-convention-reviewer"]
+  },
+  "bld_review": {
+    "subagents": [
+      "build-convention-reviewer",
+      "code-reviewer",
+      "silent-failure-hunter",
+      "type-design-analyzer",
+      "code-simplifier"
+    ]
+  },
+  "unit_review": {
+    "subagents": ["test-plan-convention-reviewer"]
+  },
+  "_optional_disabled": {
+    "_comment": "必要なら bld_review / *_review の subagents に移して有効化する（PR前提エージェント）",
+    "agents": ["comment-analyzer", "pr-test-analyzer"]
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "_note": "integrator が review_record.md テンプレをコピーする際、自ノード名で lookup してヘッダーのプレースホルダを埋める。ノード追加時はここに追記する。",
+  "_version": "v1",
+
+  "SYS_REVIEW": {
+    "label": "総合試験計画",
+    "output_path": "docs/requirements/総合試験計画レビュー記録.md",
+    "target": "docs/requirements/総合試験計画.md",
+    "upstream": "docs/requirements/要件定義書.md",
+    "baseline_args": "SYS_REVIEW docs/requirements/総合試験計画.md docs/requirements/要件定義書.md",
+    "diff_command": "python <plugin>/scripts/manage_review_baseline.py diff SYS_REVIEW docs/requirements/総合試験計画.md docs/requirements/要件定義書.md",
+    "save_command": "python <plugin>/scripts/manage_review_baseline.py save SYS_REVIEW docs/requirements/総合試験計画.md docs/requirements/要件定義書.md",
+    "trace_scan_command": "python <plugin>/scripts/trace_scan.py docs/requirements/総合試験計画.md docs/requirements/要件定義書.md",
+    "lightweight_skip_allowed": true,
+    "reviewers_key": "sys_review"
+  },
+
+  "DES_REVIEW": {
+    "label": "設計",
+    "output_path": "docs/design/設計レビュー記録.md",
+    "target": "docs/design/設計書.html",
+    "upstream": null,
+    "baseline_args": "DES_REVIEW docs/design/設計書.html",
+    "diff_command": "python <plugin>/scripts/manage_review_baseline.py diff DES_REVIEW docs/design/設計書.html",
+    "save_command": "python <plugin>/scripts/manage_review_baseline.py save DES_REVIEW docs/design/設計書.html",
+    "trace_scan_command": "python <plugin>/scripts/trace_scan.py docs/design/設計書.html",
+    "lightweight_skip_allowed": false,
+    "reviewers_key": "des_review"
+  },
+
+  "INT_REVIEW": {
+    "label": "結合試験計画",
+    "output_path": "docs/design/結合試験計画レビュー記録.md",
+    "target": "docs/design/結合試験計画.md",
+    "upstream": "docs/design/設計書.html",
+    "baseline_args": "INT_REVIEW docs/design/結合試験計画.md docs/design/設計書.html",
+    "diff_command": "python <plugin>/scripts/manage_review_baseline.py diff INT_REVIEW docs/design/結合試験計画.md docs/design/設計書.html",
+    "save_command": "python <plugin>/scripts/manage_review_baseline.py save INT_REVIEW docs/design/結合試験計画.md docs/design/設計書.html",
+    "trace_scan_command": "python <plugin>/scripts/trace_scan.py docs/design/結合試験計画.md docs/design/設計書.html",
+    "lightweight_skip_allowed": true,
+    "reviewers_key": "int_review"
+  },
+
+  "BLD_REVIEW": {
+    "label": "構築",
+    "output_path": "docs/build/構築レビュー記録.md",
+    "target": "src/<主要ソース>",
+    "target_note": "target は実装ファイル名で置換する（例: src/todo.py）。複数ファイルなら空白区切りで列挙",
+    "upstream": "docs/design/設計書.html",
+    "baseline_args": "BLD_REVIEW src/<主要ソース>",
+    "diff_command": "python <plugin>/scripts/manage_review_baseline.py diff BLD_REVIEW src/<主要ソース>",
+    "save_command": "python <plugin>/scripts/manage_review_baseline.py save BLD_REVIEW src/<主要ソース>",
+    "trace_scan_command": "python <plugin>/scripts/trace_scan.py src/<主要ソース>",
+    "lightweight_skip_allowed": false,
+    "reviewers_key": "bld_review"
+  },
+
+  "UNIT_REVIEW": {
+    "label": "単体試験計画",
+    "output_path": "docs/build/単体試験計画レビュー記録.md",
+    "target": "docs/build/単体試験計画.md",
+    "upstream": "docs/design/設計書.html",
+    "baseline_args": "UNIT_REVIEW docs/build/単体試験計画.md docs/design/設計書.html",
+    "diff_command": "python <plugin>/scripts/manage_review_baseline.py diff UNIT_REVIEW docs/build/単体試験計画.md docs/design/設計書.html",
+    "save_command": "python <plugin>/scripts/manage_review_baseline.py save UNIT_REVIEW docs/build/単体試験計画.md docs/design/設計書.html",
+    "trace_scan_command": "python <plugin>/scripts/trace_scan.py docs/build/単体試験計画.md docs/design/設計書.html",
+    "lightweight_skip_allowed": true,
+    "reviewers_key": "unit_review"
+  }
+}
