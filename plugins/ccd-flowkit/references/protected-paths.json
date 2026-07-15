@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "pattern": "docs/requirements/**",
+      "skills": ["requirements"],
+      "message": "要件定義の成果物です。requirements フェーズのマーカー取得下（状態機械ディスパッチャが管理）でのみ編集できます。"
+    },
+    {
+      "pattern": "docs/design/**",
+      "skills": ["design"],
+      "message": "設計の成果物です。design フェーズのマーカー取得下（状態機械ディスパッチャが管理）でのみ編集できます。"
+    },
+    {
+      "pattern": "docs/build/**",
+      "skills": ["build"],
+      "message": "構築の成果物です。build フェーズのマーカー取得下（状態機械ディスパッチャが管理）でのみ編集できます。"
+    },
+    {
+      "pattern": "src/**",
+      "skills": ["build"],
+      "message": "実ソースは build フェーズのマーカー取得下でのみ Claude が編集できます。手作業の編集はこの制限を受けません。"
+    },
+    {
+      "pattern": "docs/test/**",
+      "skills": ["test"],
+      "message": "試験の成果物です。test フェーズのマーカー取得下（状態機械ディスパッチャが管理）でのみ編集できます。"
+    },
+    {
+      "pattern": "docs/trace/**",
+      "skills": ["requirements", "design", "build", "test"],
+      "message": "トレーサビリティ台帳です。いずれかのフェーズのマーカー取得下でのみ編集できます。"
+    }
+  ],
+  "exclusions": []
+}
