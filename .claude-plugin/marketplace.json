@@ -1,0 +1,16 @@
+{
+  "name": "ccd-flowkit",
+  "owner": { "name": "Aslan" },
+  "metadata": {
+    "description": "開発フロー(要件定義→設計→構築→試験)をほぼ自動で進めるプラグイン集"
+  },
+  "plugins": [
+    {
+      "name": "ccd-flowkit",
+      "source": "./plugins/ccd-flowkit",
+      "description": "要件定義から総合試験までを、専任エージェント群で自動進行する開発フロー オーケストレーター",
+      "version": "0.3.0",
+      "author": { "name": "Aslan" }
+    }
+  ]
+}
